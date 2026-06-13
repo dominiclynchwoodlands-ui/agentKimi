@@ -28,6 +28,8 @@ import {
   releaseSessionLock,
 } from "./registry.js";
 import { runTurn } from "./kimi-session.js";
+import type { WorkerResult } from "./kimi-worker.js";
+import type { Worktree } from "./worktree.js";
 
 // --- Startup ---
 
@@ -83,6 +85,9 @@ function validateWorkdir(workdir: string): string | null {
   return null;
 }
 console.error("[agentKimi] server started");
+if (buildDenyWorkdirs().length === 0) {
+  console.error("[agentKimi] WARNING: no workdir deny-list configured (AGENTKIMI_DENY_PATHS unset) — sensitive directories are NOT guarded.");
+}
 
 // --- Helpers (mirrored from llm-panel) ---
 
@@ -118,13 +123,50 @@ function generateSessionId(): string {
   return `kimi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function formatDiffSection(diff: string, files: string[], truncated: boolean): string {
+interface FinalizeFailedTurnParams {
+  sessionId: string;
+  wt: Worktree;
+  err: unknown;
+  nextTurn: number;
+  prevSdkSessionId: string | null;
+}
+
+export function finalizeFailedTurn({ sessionId, wt, err, nextTurn, prevSdkSessionId }: FinalizeFailedTurnParams) {
+  const partial = (err as { workerResult?: WorkerResult }).workerResult;
+  updateSession(sessionId, {
+    turn: nextTurn,
+    sdk_session_id: partial?.sessionId || prevSdkSessionId || null,
+    status: "error",
+  });
+  const diffCapture = existsSync(wt.path) ? captureDiff(wt) : { diff: "", files: [], truncated: false, error: undefined };
+  const diffSection = formatDiffSection(diffCapture.diff, diffCapture.files, diffCapture.truncated, diffCapture.error);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `**agentKimi error** (session \`${sessionId}\`)\n\n` +
+          `${extractError(err)}\n\n` +
+          `**Partial diff:**\n${diffSection}\n\n` +
+          `_Work above is on disk in the worktree. Use agentkimi_send to continue or agentkimi_end to clean up._`,
+      },
+    ],
+    isError: true,
+  };
+}
+
+function formatDiffSection(diff: string, files: string[], truncated: boolean, diffError?: string): string {
   const header = files.length > 0
     ? `**Files changed:** ${files.join(", ")}\n\n`
     : "";
-  const body = diff
-    ? `\`\`\`diff\n${diff}\n\`\`\``
-    : "_No changes detected._";
+  let body: string;
+  if (diffError) {
+    body = `_diff capture failed: ${diffError}_`;
+  } else {
+    body = diff
+      ? `\`\`\`diff\n${diff}\n\`\`\``
+      : "_No changes detected._";
+  }
   const note = truncated ? "\n\n⚠️ _Diff truncated at 200 KB._" : "";
   return `${header}${body}${note}`;
 }
@@ -213,15 +255,25 @@ async function handleStart(args: Record<string, unknown>) {
   const wt = await createWorktree(sessionId, workdir);
   saveSession(sessionId, wt);
 
-  const turn = await runTurn({ prompt, worktree: wt });
-  updateSession(sessionId, { turn: 1, sdk_session_id: turn.sessionId || null });
+  let turn;
+  try {
+    turn = await runTurn({ prompt, worktree: wt });
+  } catch (err) {
+    return finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+  }
 
-  const { diff, files, truncated } = captureDiff(wt);
-  const diffSection = formatDiffSection(diff, files, truncated);
+  updateSession(sessionId, { turn: 1, sdk_session_id: turn.sessionId || null, status: "active" });
+
+  const { diff, files, truncated, error: diffErr } = captureDiff(wt);
+  const diffSection = formatDiffSection(diff, files, truncated, diffErr);
+
+  const isErrorNote = turn.isError
+    ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}`
+    : "";
 
   return textResult(
     `**Session started: \`${sessionId}\`**\n\n` +
-      `**Kimi summary:**\n${turn.summary}\n\n` +
+      `**Kimi summary:**\n${turn.summary}${isErrorNote}\n\n` +
       `**Diff:**\n${diffSection}\n\n` +
       `---\n_Tools fired: ${turn.toolsFired.join(", ") || "none"} | ` +
       `SDK session: ${turn.sessionId.slice(0, 8)} | ` +
@@ -245,6 +297,12 @@ async function handleSend(args: Record<string, unknown>) {
   if (rec.status === "closed") {
     return errorResult(`Session \`${sessionId}\` is already closed. Start a new session.`);
   }
+  if (rec.status === "error") {
+    if (!rec.sdk_session_id) {
+      return errorResult(`Session is in an errored state with no resumable id. Start a new session or end this one.`);
+    }
+    // has sdk_session_id — allow resume attempt (fall through)
+  }
 
   // Per-session in-process mutex
   if (!acquireSessionLock(sessionId)) {
@@ -253,18 +311,28 @@ async function handleSend(args: Record<string, unknown>) {
 
   try {
     const wt = recordToWorktree(rec);
-    const turn = await runTurn({ prompt: message, worktree: wt, resume: rec.sdk_session_id ?? undefined });
-    updateSession(sessionId, { turn: rec.turn + 1, sdk_session_id: turn.sessionId || rec.sdk_session_id });
+    let turn;
+    try {
+      turn = await runTurn({ prompt: message, worktree: wt, resume: rec.sdk_session_id ?? undefined });
+    } catch (err) {
+      return finalizeFailedTurn({ sessionId, wt, err, nextTurn: rec.turn + 1, prevSdkSessionId: rec.sdk_session_id });
+    }
 
-    const { diff, files, truncated } = captureDiff(wt);
-    const diffSection = formatDiffSection(diff, files, truncated);
+    updateSession(sessionId, { turn: rec.turn + 1, sdk_session_id: turn.sessionId || rec.sdk_session_id, status: "active" });
+
+    const { diff, files, truncated, error: diffErr } = captureDiff(wt);
+    const diffSection = formatDiffSection(diff, files, truncated, diffErr);
 
     const testSection = turn.testOutput
       ? `\n\n**Test output:**\n\`\`\`\n${turn.testOutput}\n\`\`\``
       : "";
 
+    const isErrorNote = turn.isError
+      ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}`
+      : "";
+
     return textResult(
-      `**Kimi summary (turn ${rec.turn + 1}):**\n${turn.summary}${testSection}\n\n` +
+      `**Kimi summary (turn ${rec.turn + 1}):**\n${turn.summary}${isErrorNote}${testSection}\n\n` +
         `**Diff (cumulative):**\n${diffSection}\n\n` +
         `---\n_Tools fired: ${turn.toolsFired.join(", ") || "none"}_`
     );

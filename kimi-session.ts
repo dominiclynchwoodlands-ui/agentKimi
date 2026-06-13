@@ -24,11 +24,90 @@ const PROJECT_DIR = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 const BUN_BIN = join(HOME, ".bun", "bin", "bun");
 const WORKER_SCRIPT = join(PROJECT_DIR, "kimi-worker.ts");
 
+const DEFAULT_TURN_TIMEOUT_MS = 660_000;
+const MAX_TURN_TIMEOUT_MS = 3_600_000;
+
+/** Resolve the turn timeout from AGENTKIMI_TURN_TIMEOUT_MS env var.
+ *  Only strict decimal integers (no floats, no scientific notation, no hex,
+ *  no leading/trailing junk) are accepted — anything else returns the default.
+ */
+export function resolveTurnTimeoutMs(): number {
+  const raw = process.env.AGENTKIMI_TURN_TIMEOUT_MS;
+  if (!raw) return DEFAULT_TURN_TIMEOUT_MS;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_TURN_TIMEOUT_MS;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_TURN_TIMEOUT_MS;
+  return Math.min(parsed, MAX_TURN_TIMEOUT_MS);
+}
+
 export interface TurnResult {
   sessionId: string;
   summary: string;
   toolsFired: string[];
   testOutput: string | null;
+  subtype?: string;
+  isError?: boolean;
+}
+
+/** Parse the outcome of a spawned worker process into a TurnResult or throw. */
+export function parseWorkerOutcome(proc: {
+  status: number | null;
+  signal?: string | null;
+  stdout: string | null;
+  stderr: string | null;
+  error?: Error | null;
+}): TurnResult {
+  // 1. spawn-level error (bwrap itself failed to start)
+  if (proc.error) {
+    throw new Error(`bwrap spawn failed: ${proc.error.message}`);
+  }
+
+  // 2. Parse last non-empty stdout line as JSON
+  const lines = (proc.stdout ?? "").split("\n").filter(Boolean);
+  const lastLine = lines.at(-1);
+  let parsed: WorkerResult | null = null;
+  if (lastLine) {
+    try {
+      parsed = JSON.parse(lastLine) as WorkerResult;
+    } catch {
+      parsed = null;
+    }
+  }
+
+  // 3. Non-zero exit — attach workerResult whenever parsed is present so callers
+  //    can recover partial state (sessionId, etc.) even when error:"" is empty.
+  if (proc.status !== 0) {
+    const signalInfo = proc.signal ? ` (killed by signal ${proc.signal})` : "";
+    const message = parsed?.error
+      ? `kimi-worker error: ${parsed.error}`
+      : `kimi-worker exited ${proc.status}${signalInfo}. stderr: ${(proc.stderr ?? "").slice(0, 400)}`;
+    const err = new Error(message);
+    if (parsed !== null) {
+      (err as Error & { workerResult: WorkerResult }).workerResult = parsed;
+    }
+    throw err;
+  }
+
+  // 4. Status 0 but no parseable output
+  if (!parsed) {
+    throw new Error("kimi-worker produced no output");
+  }
+
+  // 5. Status 0 but worker reported an error
+  if (parsed.error) {
+    throw Object.assign(new Error(`kimi-worker error: ${parsed.error}`), { workerResult: parsed });
+  }
+
+  // 6. Happy path
+  return {
+    sessionId: parsed.sessionId,
+    summary: parsed.summary,
+    toolsFired: parsed.toolsFired,
+    testOutput: parsed.testOutput,
+    subtype: parsed.subtype,
+    isError: parsed.isError,
+  };
 }
 
 export interface RunTurnParams {
@@ -77,7 +156,7 @@ export async function runTurn(params: RunTurnParams): Promise<TurnResult> {
   const proc = spawnSync(bwrapArgv[0], bwrapArgv.slice(1), {
     input: JSON.stringify(job),
     encoding: "utf8",
-    timeout: 660_000, // 11 min — allows maxTurns:30 × ~20s each
+    timeout: resolveTurnTimeoutMs(),
     maxBuffer: 50 * 1024 * 1024,
   });
 
@@ -91,25 +170,5 @@ export async function runTurn(params: RunTurnParams): Promise<TurnResult> {
     }
   }
 
-  if (proc.error) throw new Error(`bwrap spawn failed: ${proc.error.message}`);
-  if (proc.status !== 0) {
-    throw new Error(
-      `kimi-worker exited ${proc.status}. stderr: ${(proc.stderr ?? "").slice(0, 400)}`
-    );
-  }
-
-  // Parse the last JSON line from stdout (worker writes exactly one JSON line)
-  const lines = (proc.stdout ?? "").split("\n").filter(Boolean);
-  const lastLine = lines.at(-1);
-  if (lastLine === undefined) throw new Error("kimi-worker produced no output");
-  const result: WorkerResult = JSON.parse(lastLine);
-
-  if (result.error) throw new Error(`kimi-worker error: ${result.error}`);
-
-  return {
-    sessionId: result.sessionId,
-    summary: result.summary,
-    toolsFired: result.toolsFired,
-    testOutput: result.testOutput,
-  };
+  return parseWorkerOutcome(proc);
 }

@@ -27,6 +27,8 @@ export interface WorkerResult {
   testOutput: string | null;
   toolsFired: string[];
   error?: string;
+  subtype?: string;
+  isError?: boolean;
 }
 
 const TEST_OUTPUT_RE = /```###\s*TEST OUTPUT\s*\n([\s\S]*?)```/i;
@@ -68,6 +70,8 @@ async function main() {
 
   let sessionId = "";
   let summary = "";
+  let subtype: string | undefined;
+  let isError = false;
   const toolsFired = new Set<string>();
 
   try {
@@ -79,7 +83,14 @@ async function main() {
         for (const b of content)
           if ((b as { type: string }).type === "tool_use") toolsFired.add((b as { name: string }).name);
       }
-      if (msg.type === "result") summary = (m.result as string) ?? "";
+      if (msg.type === "result") {
+        summary = (m.result as string) ?? "";
+        subtype = typeof m.subtype === "string" ? m.subtype : undefined;
+        isError = typeof m.is_error === "boolean" ? m.is_error : false;
+        if (isError && summary === "") {
+          summary = `(kimi session ended: ${subtype ?? "error"})`;
+        }
+      }
     }
   } catch (e) {
     const result: WorkerResult = {
@@ -99,6 +110,8 @@ async function main() {
     summary,
     testOutput: testMatch?.[1]?.trim() ?? null,
     toolsFired: [...toolsFired],
+    subtype,
+    isError: isError || undefined,
   };
   process.stdout.write(JSON.stringify(result) + "\n");
 }

@@ -200,6 +200,7 @@ export interface DiffResult {
   diff: string;
   files: string[];
   truncated: boolean;
+  error?: string;
 }
 
 const MAX_DIFF_BYTES = 200 * 1024; // 200 KB
@@ -224,9 +225,11 @@ export function captureDiff(wt: Worktree): DiffResult {
   }
 
   let diff = "";
+  let diffError: string | undefined;
   try {
     diff = git([...neutralize, "diff", ...DIFF_FLAGS, wt.baseCommit], wtOpts);
-  } catch {
+  } catch (e) {
+    diffError = (e instanceof Error ? e.message : String(e)).slice(0, 300);
     diff = "";
   }
 
@@ -244,7 +247,7 @@ export function captureDiff(wt: Worktree): DiffResult {
     files = [];
   }
 
-  return { diff, files, truncated };
+  return { diff, files, truncated, error: diffError };
 }
 
 /**
