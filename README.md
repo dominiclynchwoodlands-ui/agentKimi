@@ -1,5 +1,11 @@
 # agentKimi
 
+> **Status: work in progress.** This is an early public release under active
+> development — expect rough edges and breaking changes. **Bug reports and pull
+> requests are very welcome** — open an
+> [issue](https://github.com/dominiclynchwoodlands-ui/agentKimi/issues) or a PR
+> (see [Contributing](#contributing)).
+
 An MCP server that runs **Kimi K2.7-code** (Moonshot AI) as an autonomous coding
 agent inside a **bubblewrap-sandboxed git worktree**. Kimi gets the full Claude Code
 toolset (Write, Edit, Bash, Read, Glob, Grep, …) via the Claude Agent SDK, works in
@@ -199,6 +205,22 @@ env-isolation hardening. `smoke.ts` exercises the real bwrap sandbox and a live 
 turn, and requires `KIMI_API_KEY` to be exported.
 
 ---
+
+## Contributing
+
+agentKimi is a work in progress and contributions are welcome.
+
+- **Bug reports** — open a
+  [GitHub issue](https://github.com/dominiclynchwoodlands-ui/agentKimi/issues)
+  with steps to reproduce, your OS/kernel, and `bwrap --version`. Sandbox or
+  isolation issues are especially valuable.
+- **Pull requests** — open a PR against `main`. Before submitting, run
+  `bunx tsc --noEmit` and `bun test` (both must be green) and describe what you
+  changed and why.
+
+Because the security model is the core of this project, any change touching the
+sandbox (`bwrap.ts`, `sandbox.ts`, `worktree.ts`) should add or update the
+relevant `*.security.test.ts` regressions.
 
 ## License
 
