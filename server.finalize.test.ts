@@ -9,7 +9,7 @@ import { test, expect, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { finalizeFailedTurn } from "./server.js";
+import { finalizeFailedTurn, decideTurnStatus, checkResumeAllowed } from "./server.js";
 import { saveSession, loadSession, closeSession } from "./registry.js";
 import type { Worktree } from "./worktree.js";
 
@@ -71,7 +71,7 @@ test("finalizeFailedTurn: result isError:true, content contains error and sessio
   saveSession(sessionId, wt);
 
   const err = makeErr("sdk-abc");
-  const result = finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+  const result = finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
 
   expect(result.isError).toBe(true);
   const text = result.content[0]!.text;
@@ -87,13 +87,15 @@ test("finalizeFailedTurn: registry updated to error, turn bumped, sdk_session_id
   saveSession(sessionId, wt);
 
   const err = makeErr("sdk-abc");
-  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 3, prevSdkSessionId: "prev-sdk" });
+  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 3, prevSdkSessionId: "prev-sdk", prevErrorCount: 0 });
 
   const rec = loadSession(sessionId);
   expect(rec!.status).toBe("error");
   expect(rec!.turn).toBe(3);
   // workerResult.sessionId "sdk-abc" is non-empty → wins over prevSdkSessionId
   expect(rec!.sdk_session_id).toBe("sdk-abc");
+  // error_count increments: 0 → 1
+  expect(rec!.error_count).toBe(1);
 });
 
 // (c) empty workerResult.sessionId + prevSdkSessionId provided → stored prevSdkSessionId (NOT "")
@@ -104,10 +106,12 @@ test("finalizeFailedTurn: empty workerResult.sessionId falls back to prevSdkSess
   saveSession(sessionId, wt);
 
   const err = makeErr(""); // empty sessionId in workerResult
-  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: "prev-sdk-xyz" });
+  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: "prev-sdk-xyz", prevErrorCount: 2 });
 
   const rec = loadSession(sessionId);
   expect(rec!.sdk_session_id).toBe("prev-sdk-xyz");
+  // error_count increments: 2 → 3
+  expect(rec!.error_count).toBe(3);
 });
 
 // (c) empty workerResult.sessionId + prevSdkSessionId null → stored null
@@ -118,7 +122,7 @@ test("finalizeFailedTurn: empty workerResult.sessionId + null prevSdkSessionId �
   saveSession(sessionId, wt);
 
   const err = makeErr("");
-  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
 
   const rec = loadSession(sessionId);
   expect(rec!.sdk_session_id).toBeNull();
@@ -135,7 +139,7 @@ test("finalizeFailedTurn: non-existent wt.path does not throw, returns empty dif
   const err = makeErr("sdk-abc");
   let result: ReturnType<typeof finalizeFailedTurn> | undefined;
   expect(() => {
-    result = finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+    result = finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
   }).not.toThrow();
   expect(result).toBeDefined();
   // Empty diff section renders as "_No changes detected._"
@@ -151,6 +155,50 @@ test("finalizeFailedTurn: existing wt.path (no git) does not throw", () => {
 
   const err = makeErr("sdk-abc");
   expect(() => {
-    finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+    finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
   }).not.toThrow();
+});
+
+// --- decideTurnStatus ---
+
+test("decideTurnStatus: isError:false → active, terminal:false", () => {
+  expect(decideTurnStatus({ isError: false })).toEqual({ status: "active", terminal: false });
+});
+
+test("decideTurnStatus: isError:true + error_max_turns → active (resumable), terminal:false", () => {
+  expect(decideTurnStatus({ isError: true, subtype: "error_max_turns" })).toEqual({ status: "active", terminal: false });
+});
+
+test("decideTurnStatus: isError:true + error_during_execution → error, terminal:true", () => {
+  expect(decideTurnStatus({ isError: true, subtype: "error_during_execution" })).toEqual({ status: "error", terminal: true });
+});
+
+// --- checkResumeAllowed ---
+
+test("checkResumeAllowed: closed → returns error string", () => {
+  const result = checkResumeAllowed({ status: "closed", sdk_session_id: null });
+  expect(result).not.toBeNull();
+  expect(result).toContain("closed");
+});
+
+test("checkResumeAllowed: error + no sdk_session_id → returns error string", () => {
+  const result = checkResumeAllowed({ status: "error", sdk_session_id: null });
+  expect(result).not.toBeNull();
+  expect(result).toContain("no resumable id");
+});
+
+test("checkResumeAllowed: error + sdk_session_id + error_count 3 → returns circuit-breaker string", () => {
+  const result = checkResumeAllowed({ status: "error", sdk_session_id: "sdk-abc", error_count: 3 });
+  expect(result).not.toBeNull();
+  expect(result).toContain("3 consecutive");
+});
+
+test("checkResumeAllowed: error + sdk_session_id + error_count 1 → null (resume allowed)", () => {
+  const result = checkResumeAllowed({ status: "error", sdk_session_id: "sdk-abc", error_count: 1 });
+  expect(result).toBeNull();
+});
+
+test("checkResumeAllowed: active → null (no block)", () => {
+  const result = checkResumeAllowed({ status: "active", sdk_session_id: "sdk-xyz" });
+  expect(result).toBeNull();
 });

@@ -123,20 +123,44 @@ function generateSessionId(): string {
   return `kimi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// --- Pure exported helpers (testable without MCP wiring) ---
+
+/** Determine registry status + terminal flag from an SDK turn result. */
+export function decideTurnStatus(turn: { isError?: boolean; subtype?: string }): { status: "active" | "error"; terminal: boolean } {
+  if (!turn.isError) return { status: "active", terminal: false };
+  if (turn.subtype === "error_max_turns") return { status: "active", terminal: false };
+  return { status: "error", terminal: true };
+}
+
+const MAX_CONSECUTIVE_ERRORS = 3;
+
+/** Guard for handleSend: returns an error string if the resume should be blocked, else null. */
+export function checkResumeAllowed(rec: { status: string; sdk_session_id: string | null; error_count?: number }): string | null {
+  if (rec.status === "closed") return `Session is already closed. Start a new session.`;
+  if (rec.status === "error") {
+    if (!rec.sdk_session_id) return `Session is in an errored state with no resumable id. Start a new session or end this one.`;
+    if ((rec.error_count ?? 0) >= MAX_CONSECUTIVE_ERRORS)
+      return `Session has failed ${rec.error_count} consecutive times; the SDK session is likely unrecoverable. End it (agentkimi_end) and start fresh.`;
+  }
+  return null;
+}
+
 interface FinalizeFailedTurnParams {
   sessionId: string;
   wt: Worktree;
   err: unknown;
   nextTurn: number;
   prevSdkSessionId: string | null;
+  prevErrorCount: number;
 }
 
-export function finalizeFailedTurn({ sessionId, wt, err, nextTurn, prevSdkSessionId }: FinalizeFailedTurnParams) {
+export function finalizeFailedTurn({ sessionId, wt, err, nextTurn, prevSdkSessionId, prevErrorCount }: FinalizeFailedTurnParams) {
   const partial = (err as { workerResult?: WorkerResult }).workerResult;
   updateSession(sessionId, {
     turn: nextTurn,
     sdk_session_id: partial?.sessionId || prevSdkSessionId || null,
     status: "error",
+    error_count: prevErrorCount + 1,
   });
   const diffCapture = existsSync(wt.path) ? captureDiff(wt) : { diff: "", files: [], truncated: false, error: undefined };
   const diffSection = formatDiffSection(diffCapture.diff, diffCapture.files, diffCapture.truncated, diffCapture.error);
@@ -259,16 +283,17 @@ async function handleStart(args: Record<string, unknown>) {
   try {
     turn = await runTurn({ prompt, worktree: wt });
   } catch (err) {
-    return finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null });
+    return finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
   }
 
-  updateSession(sessionId, { turn: 1, sdk_session_id: turn.sessionId || null, status: "active" });
+  const { status, terminal } = decideTurnStatus(turn);
+  updateSession(sessionId, { turn: 1, sdk_session_id: turn.sessionId || null, status, error_count: terminal ? 1 : 0 });
 
   const { diff, files, truncated, error: diffErr } = captureDiff(wt);
   const diffSection = formatDiffSection(diff, files, truncated, diffErr);
 
   const isErrorNote = turn.isError
-    ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}`
+    ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}${terminal ? " — session marked errored; start fresh if a resume fails." : ""}`
     : "";
 
   return textResult(
@@ -294,15 +319,8 @@ async function handleSend(args: Record<string, unknown>) {
   if (!rec) {
     return errorResult(`Session not found: \`${sessionId}\`. It may have been ended or never started.`);
   }
-  if (rec.status === "closed") {
-    return errorResult(`Session \`${sessionId}\` is already closed. Start a new session.`);
-  }
-  if (rec.status === "error") {
-    if (!rec.sdk_session_id) {
-      return errorResult(`Session is in an errored state with no resumable id. Start a new session or end this one.`);
-    }
-    // has sdk_session_id — allow resume attempt (fall through)
-  }
+  const resumeBlock = checkResumeAllowed(rec);
+  if (resumeBlock) return errorResult(resumeBlock);
 
   // Per-session in-process mutex
   if (!acquireSessionLock(sessionId)) {
@@ -315,10 +333,11 @@ async function handleSend(args: Record<string, unknown>) {
     try {
       turn = await runTurn({ prompt: message, worktree: wt, resume: rec.sdk_session_id ?? undefined });
     } catch (err) {
-      return finalizeFailedTurn({ sessionId, wt, err, nextTurn: rec.turn + 1, prevSdkSessionId: rec.sdk_session_id });
+      return finalizeFailedTurn({ sessionId, wt, err, nextTurn: rec.turn + 1, prevSdkSessionId: rec.sdk_session_id, prevErrorCount: rec.error_count ?? 0 });
     }
 
-    updateSession(sessionId, { turn: rec.turn + 1, sdk_session_id: turn.sessionId || rec.sdk_session_id, status: "active" });
+    const { status, terminal } = decideTurnStatus(turn);
+    updateSession(sessionId, { turn: rec.turn + 1, sdk_session_id: turn.sessionId || rec.sdk_session_id, status, error_count: terminal ? (rec.error_count ?? 0) + 1 : 0 });
 
     const { diff, files, truncated, error: diffErr } = captureDiff(wt);
     const diffSection = formatDiffSection(diff, files, truncated, diffErr);
@@ -328,7 +347,7 @@ async function handleSend(args: Record<string, unknown>) {
       : "";
 
     const isErrorNote = turn.isError
-      ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}`
+      ? `\n\n⚠️ Kimi ended via ${turn.subtype ?? "error"}${terminal ? " — session marked errored; start fresh if a resume fails." : ""}`
       : "";
 
     return textResult(

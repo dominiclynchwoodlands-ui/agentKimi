@@ -38,6 +38,7 @@ export interface SessionRecord {
   sdk_session_id: string | null;  // Anthropic/Moonshot SDK session UUID for resume
   turn: number;
   status: SessionStatus;
+  error_count?: number;           // consecutive error turns; absent → treat as 0
   created_at: string;
   updated_at: string;
 }
@@ -190,7 +191,7 @@ export function loadSession(sessionId: string): SessionRecord | null {
 
 export function updateSession(
   sessionId: string,
-  patch: Partial<Pick<SessionRecord, "turn" | "status" | "sdk_session_id">>
+  patch: Partial<Pick<SessionRecord, "turn" | "status" | "sdk_session_id" | "error_count">>
 ): void {
   writeRegistry((r) => {
     const existing = r[sessionId];
