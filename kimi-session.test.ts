@@ -59,15 +59,51 @@ test("parseWorkerOutcome: status 0 + valid result → returns TurnResult", () =>
   expect(result.toolsFired).toEqual(["Write", "Bash"]);
 });
 
-test("parseWorkerOutcome: proc.error set → 'bwrap spawn failed'", () => {
+test("parseWorkerOutcome: proc.error set (non-timeout) → 'bwrap spawn failed'", () => {
   const proc = {
     status: null,
     stdout: null,
     stderr: null,
-    error: new Error("ENOENT: bwrap not found"),
+    error: Object.assign(new Error("ENOENT: bwrap not found"), { code: "ENOENT" }),
   };
   expect(() => parseWorkerOutcome(proc)).toThrow("bwrap spawn failed");
   expect(() => parseWorkerOutcome(proc)).toThrow("ENOENT: bwrap not found");
+});
+
+test("parseWorkerOutcome: proc.error ETIMEDOUT + sentinel in stderr → throws 'timed out' with workerResult.sessionId recovered", () => {
+  const proc = {
+    status: null,
+    stdout: null,
+    stderr: "some gate noise\n__AGENTKIMI_SESSION__ abc123\nmore noise",
+    error: Object.assign(new Error("spawnSync ETIMEDOUT"), { code: "ETIMEDOUT" }),
+  };
+  let thrown: unknown;
+  try {
+    parseWorkerOutcome(proc);
+  } catch (e) {
+    thrown = e;
+  }
+  expect(thrown).toBeDefined();
+  expect((thrown as Error).message).toContain("timed out");
+  expect((thrown as { workerResult?: { sessionId: string } }).workerResult?.sessionId).toBe("abc123");
+});
+
+test("parseWorkerOutcome: proc.error ETIMEDOUT + no sentinel in stderr → throws 'timed out' with no workerResult", () => {
+  const proc = {
+    status: null,
+    stdout: null,
+    stderr: "some gate noise without a session id",
+    error: Object.assign(new Error("spawnSync ETIMEDOUT"), { code: "ETIMEDOUT" }),
+  };
+  let thrown: unknown;
+  try {
+    parseWorkerOutcome(proc);
+  } catch (e) {
+    thrown = e;
+  }
+  expect(thrown).toBeDefined();
+  expect((thrown as Error).message).toContain("timed out");
+  expect((thrown as { workerResult?: unknown }).workerResult).toBeUndefined();
 });
 
 test("parseWorkerOutcome: status 0 + no output → 'kimi-worker produced no output'", () => {

@@ -72,12 +72,24 @@ async function main() {
   let summary = "";
   let subtype: string | undefined;
   let isError = false;
+  let sessionIdEmitted = false;
   const toolsFired = new Set<string>();
 
   try {
     for await (const msg of query({ prompt: job.prompt, options })) {
       const m = msg as Record<string, unknown>;
-      if (typeof m.session_id === "string" && m.session_id) sessionId = m.session_id;
+      if (typeof m.session_id === "string" && m.session_id) {
+        sessionId = m.session_id;
+        // Emit the SDK session id to stderr the moment it's first captured.
+        // If a long turn is later SIGTERM-killed by the parent's spawnSync
+        // timeout, this sentinel line is already in the buffered stderr that
+        // Node returns on ETIMEDOUT — letting the caller recover sessionId
+        // and keep the turn resumable even though stdout never got written.
+        if (!sessionIdEmitted) {
+          sessionIdEmitted = true;
+          process.stderr.write(`__AGENTKIMI_SESSION__ ${sessionId}\n`);
+        }
+      }
       if (msg.type === "assistant") {
         const content = (m.message as { content: unknown[] })?.content ?? [];
         for (const b of content)

@@ -128,6 +128,30 @@ test("finalizeFailedTurn: empty workerResult.sessionId + null prevSdkSessionId â
   expect(rec!.sdk_session_id).toBeNull();
 });
 
+// (timeout recovery) workerResult.sessionId from a SIGTERM-killed/ETIMEDOUT
+// turn is persisted as sdk_session_id, and checkResumeAllowed then permits resume.
+test("finalizeFailedTurn: recovered timeout workerResult.sessionId persisted, resume then allowed", () => {
+  const sessionId = makeSessionId();
+  cleanupIds.push(sessionId);
+  const wt = makeWorktreeStub(false);
+  saveSession(sessionId, wt);
+
+  const err = Object.assign(new Error("kimi turn timed out after 660000ms"), {
+    workerResult: {
+      sessionId: "abc123",
+      summary: "",
+      testOutput: null,
+      toolsFired: [],
+      error: "turn timed out",
+    },
+  });
+  finalizeFailedTurn({ sessionId, wt, err, nextTurn: 1, prevSdkSessionId: null, prevErrorCount: 0 });
+
+  const rec = loadSession(sessionId);
+  expect(rec!.sdk_session_id).toBe("abc123");
+  expect(checkResumeAllowed({ status: rec!.status, sdk_session_id: rec!.sdk_session_id, error_count: rec!.error_count })).toBeNull();
+});
+
 // (d) non-existent wt.path does NOT throw and yields empty diff section
 test("finalizeFailedTurn: non-existent wt.path does not throw, returns empty diff", () => {
   const sessionId = makeSessionId();

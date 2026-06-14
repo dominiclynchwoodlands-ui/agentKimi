@@ -56,10 +56,28 @@ export function parseWorkerOutcome(proc: {
   signal?: string | null;
   stdout: string | null;
   stderr: string | null;
-  error?: Error | null;
+  error?: (Error & { code?: string }) | null;
 }): TurnResult {
-  // 1. spawn-level error (bwrap itself failed to start)
+  // 1. spawn-level error (bwrap itself failed to start, OR spawnSync's own
+  //    timeout fired and SIGTERM-killed the worker).
   if (proc.error) {
+    if (proc.error.code === "ETIMEDOUT") {
+      // Node drains stderr buffered before the kill, so a sentinel line the
+      // worker wrote early (see kimi-worker.ts) may still be present here.
+      const match = (proc.stderr ?? "").match(/^__AGENTKIMI_SESSION__ (.+)$/m);
+      const timeoutErr = new Error(`kimi turn timed out after ${resolveTurnTimeoutMs()}ms`);
+      if (match) {
+        const recovered: WorkerResult = {
+          sessionId: match[1]!,
+          summary: "",
+          testOutput: null,
+          toolsFired: [],
+          error: "turn timed out",
+        };
+        (timeoutErr as Error & { workerResult: WorkerResult }).workerResult = recovered;
+      }
+      throw timeoutErr;
+    }
     throw new Error(`bwrap spawn failed: ${proc.error.message}`);
   }
 
@@ -163,9 +181,11 @@ export async function runTurn(params: RunTurnParams): Promise<TurnResult> {
   // Always clean up sandbox home
   try { rmSync(sandboxHome, { recursive: true, force: true }); } catch { /* best-effort */ }
 
-  // Forward gate logs from worker stderr
+  // Forward gate logs from worker stderr (drop the session-id sentinel —
+  // it's consumed by parseWorkerOutcome on timeout, not meant for gate logs).
   if (proc.stderr) {
     for (const line of proc.stderr.split("\n").filter(Boolean)) {
+      if (/^__AGENTKIMI_SESSION__ /.test(line)) continue;
       process.stderr.write(line + "\n");
     }
   }
