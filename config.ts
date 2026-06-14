@@ -35,6 +35,27 @@ export const WORKTREES_DIR = join(AGENTKIMI_HOME, "worktrees");
  */
 export const GITDIRS_DIR = join(AGENTKIMI_HOME, "gitdirs");
 
+// --- Sub-agent fan-out cap ---
+
+/**
+ * SDK tools that let a single turn spawn its own sub-agents. spawnSync already
+ * serializes turns (one worker process at a time), so the agent invoking the
+ * Task tool is the ONLY uncapped way one turn can multiply processes/memory.
+ */
+export const SUBAGENT_FANOUT_TOOLS = ["Task"] as const;
+
+/**
+ * Whether the sandboxed Kimi agent may spawn its OWN sub-agents (SDK Task tool).
+ *
+ * Capped to zero by default: the Task tool is disallowed so a single turn can
+ * never fan out into N additional query()/agent processes. Set
+ * AGENTKIMI_ALLOW_SUBAGENTS=1 to opt back in for a task that genuinely needs
+ * delegated sub-agents. Only the literal string "1" enables it.
+ */
+export function resolveAllowSubagents(): boolean {
+  return process.env.AGENTKIMI_ALLOW_SUBAGENTS === "1";
+}
+
 // --- Key resolution ---
 
 /** Env var names to probe for the Moonshot / Kimi key (first non-empty wins). */

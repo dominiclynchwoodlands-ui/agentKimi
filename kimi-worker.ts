@@ -12,6 +12,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { buildHook, buildCanUseTool } from "./sandbox.js";
+import { resolveAllowSubagents, SUBAGENT_FANOUT_TOOLS } from "./config.js";
 
 export interface WorkerJob {
   prompt: string;
@@ -65,6 +66,10 @@ async function main() {
     skills: "all",
     executable: "bun",
     maxTurns: 30,
+    // Cap fan-out: by default the agent may not spawn its own sub-agents.
+    // spawnSync serializes turns, so the Task tool is the only uncapped way a
+    // single turn can multiply processes/memory. Opt in with AGENTKIMI_ALLOW_SUBAGENTS=1.
+    ...(resolveAllowSubagents() ? {} : { disallowedTools: [...SUBAGENT_FANOUT_TOOLS] }),
   };
   const options: Options = job.resume ? { ...baseOptions, resume: job.resume } : baseOptions;
 

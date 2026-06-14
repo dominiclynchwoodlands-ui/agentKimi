@@ -52,3 +52,38 @@ test("buildBwrapArgv (--clearenv) blocks server-env secrets from entering the na
     for (const d of [sandboxHome, wt, cfgDir]) rmSync(d, { recursive: true, force: true });
   }
 });
+
+// --- Sub-agent fan-out cap propagation ---
+//
+// --clearenv drops AGENTKIMI_ALLOW_SUBAGENTS, so the opt-in only reaches the
+// worker if buildBwrapArgv re-sets it. Default (capped) must NOT set it.
+
+const FANOUT_CFG = {
+  worktree: "/tmp/fanout-wt",
+  sandboxHome: "/tmp/fanout-home",
+  cfgDir: "/tmp/fanout-cfg",
+  projectDir: "/tmp/fanout-proj",
+  noNet: false,
+};
+
+function setenvValue(argv: string[], name: string): string | undefined {
+  for (let i = 0; i < argv.length - 2; i++) {
+    if (argv[i] === "--setenv" && argv[i + 1] === name) return argv[i + 2];
+  }
+  return undefined;
+}
+
+test("buildBwrapArgv: allowSubagents omitted → AGENTKIMI_ALLOW_SUBAGENTS NOT set (cap stays on)", () => {
+  const argv = buildBwrapArgv(FANOUT_CFG, ["/usr/bin/env"]);
+  expect(setenvValue(argv, "AGENTKIMI_ALLOW_SUBAGENTS")).toBeUndefined();
+});
+
+test("buildBwrapArgv: allowSubagents=false → AGENTKIMI_ALLOW_SUBAGENTS NOT set", () => {
+  const argv = buildBwrapArgv({ ...FANOUT_CFG, allowSubagents: false }, ["/usr/bin/env"]);
+  expect(setenvValue(argv, "AGENTKIMI_ALLOW_SUBAGENTS")).toBeUndefined();
+});
+
+test("buildBwrapArgv: allowSubagents=true → AGENTKIMI_ALLOW_SUBAGENTS=1 propagated into namespace", () => {
+  const argv = buildBwrapArgv({ ...FANOUT_CFG, allowSubagents: true }, ["/usr/bin/env"]);
+  expect(setenvValue(argv, "AGENTKIMI_ALLOW_SUBAGENTS")).toBe("1");
+});

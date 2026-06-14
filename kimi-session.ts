@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { buildKimiEnv, CFG_DIR } from "./config.js";
+import { buildKimiEnv, CFG_DIR, resolveAllowSubagents } from "./config.js";
 import { ensureConfigDir } from "./sandbox.js";
 import { buildBwrapArgv } from "./bwrap.js";
 import type { Worktree } from "./worktree.js";
@@ -153,6 +153,7 @@ export async function runTurn(params: RunTurnParams): Promise<TurnResult> {
     cfgDir: CFG_DIR,
     projectDir: PROJECT_DIR,
     noNet,
+    allowSubagents: resolveAllowSubagents(),
   };
 
   // CLAUDE_CONFIG_DIR points to the sandboxHome's .claude dir.

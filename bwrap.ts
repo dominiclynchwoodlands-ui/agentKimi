@@ -47,6 +47,7 @@ export interface BwrapConfig {
   cfgDir: string;        // rw — deny-only settings.json
   projectDir: string;    // agentkimi project root (ro)
   noNet: boolean;        // true → --unshare-net
+  allowSubagents?: boolean; // true → let the worker spawn its own sub-agents (Task tool)
 }
 
 export function buildBwrapArgv(cfg: BwrapConfig, workerArgs: string[]): [string, ...string[]] {
@@ -127,6 +128,12 @@ export function buildBwrapArgv(cfg: BwrapConfig, workerArgs: string[]): [string,
   argv.push("--new-session");
 
   if (cfg.noNet) argv.push("--unshare-net");
+
+  // --- Sub-agent fan-out opt-in (non-secret) ---
+  // --clearenv drops AGENTKIMI_ALLOW_SUBAGENTS, so the worker only sees it if
+  // we re-set it here. Default (unset) keeps the cap on: the worker disallows
+  // the Task tool so a single turn can't fan out into N more agent processes.
+  if (cfg.allowSubagents) argv.push("--setenv", "AGENTKIMI_ALLOW_SUBAGENTS", "1");
 
   // --- The worker command ---
   argv.push(...workerArgs);
